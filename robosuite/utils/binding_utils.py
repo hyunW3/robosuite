@@ -46,6 +46,10 @@ if macros.MUJOCO_GPU_RENDERING and os.environ.get("MUJOCO_GL", None) not in ["os
 _MUJOCO_GL = os.environ.get("MUJOCO_GL", "").lower().strip()
 
 
+# MjrContext wrappers that could not be freed under their own GL context (see MjRenderContext.__del__).
+_UNFREED_MJR_CONTEXTS = []
+
+
 class MjRenderContext:
     """
     Class that encapsulates rendering functionality for a
@@ -120,6 +124,7 @@ class MjRenderContext:
 
     def update_offscreen_size(self, width, height):
         if (width != self.con.offWidth) or (height != self.con.offHeight):
+            self.gl_ctx.make_current()  # con.free() below releases objects in the bound context
             self.model.vis.global_.offwidth = width
             self.model.vis.global_.offheight = height
             self.con.free()
@@ -127,8 +132,12 @@ class MjRenderContext:
             self._set_mujoco_context_and_buffers()
 
     def render(self, width, height, camera_id=None, segmentation=False):
+        # mjr_render draws into whichever GL context is *currently bound*, not into self.con, and
+        # framebuffer/texture names are per context. Another context may have been bound since the
+        # last render (a second env in the same process, or one being torn down), which silently
+        # renders this camera into the other context's framebuffer -- the "switching of the cameras"
+        # and pixel errors of issue #779. Bind ours first; it is a no-op when already current.
         self.gl_ctx.make_current()
-
         viewport = mujoco.MjrRect(0, 0, width, height)
 
         # if self.sim.render_callback is not None:
@@ -167,6 +176,7 @@ class MjRenderContext:
             self.scn.flags[mujoco.mjtRndFlag.mjRND_IDCOLOR] = 0
 
     def read_pixels(self, width, height, depth=False, segmentation=False):
+        self.gl_ctx.make_current()  # mjr_readPixels reads the bound context; see render()
         viewport = mujoco.MjrRect(0, 0, width, height)
         rgb_img = np.empty((height, width, 3), dtype=np.uint8)
         depth_img = np.empty((height, width), dtype=np.float32) if depth else None
@@ -198,19 +208,57 @@ class MjRenderContext:
         mujoco.mjr_uploadTexture(self.model._model, self.con, tex_id)
 
     def __del__(self):
-        # free mujoco rendering context and GL rendering context
-        self.con.free()
+        # Free the mujoco rendering context and the GL rendering context.
+        # mjr_freeContext (MjrContext.free) releases GL objects in the *currently bound* GL context. A render
+        # context collected while another one is current (e.g. the previous sim's context after reset())
+        # would therefore delete the live context's framebuffer/textures. Bind our own GL context first
+        # (EGL backend), free under it, then restore the previously bound context.
+        con = getattr(self, "con", None)
+        gl_ctx = getattr(self, "gl_ctx", None)
+        own = getattr(gl_ctx, "_context", None)  # EGLGLContext only; other backends keep the old behaviour
+        egl = None
+        prev = None
+        switched = False
+        if own is not None:
+            try:
+                from OpenGL import EGL as egl
+
+                prev = egl.eglGetCurrentContext()
+                if (getattr(prev, "address", 0) or 0) != own.address:
+                    gl_ctx.make_current()
+                    switched = True
+            except Exception:
+                egl = None
+        freed = False
+        if con is not None:
+            try:
+                if own is None or (
+                    egl is not None and (getattr(egl.eglGetCurrentContext(), "address", 0) or 0) == own.address
+                ):
+                    con.free()
+                    freed = True
+            except Exception:
+                pass
+            if not freed:
+                # Our own context could not be bound: keep the wrapper alive so its destructor never frees
+                # under a foreign context. Destroying the EGL context below releases the GL objects anyway.
+                _UNFREED_MJR_CONTEXTS.append(con)
         try:
-            self.gl_ctx.free()
+            if gl_ctx is not None:
+                gl_ctx.free()
         except Exception:
             # avoid getting OpenGL.error.GLError
             pass
-        del self.con
-        del self.gl_ctx
-        del self.scn
-        del self.cam
-        del self.vopt
-        del self.pert
+        if switched and (getattr(prev, "address", 0) or 0):
+            try:
+                from robosuite.renderers.context.egl_context import EGL_DISPLAY
+
+                egl.eglMakeCurrent(EGL_DISPLAY, egl.EGL_NO_SURFACE, egl.EGL_NO_SURFACE, prev)
+            except Exception:
+                pass
+        for name in ("con", "gl_ctx", "scn", "cam", "vopt", "pert"):
+            if hasattr(self, name):
+                delattr(self, name)
 
 
 class MjRenderContextOffscreen(MjRenderContext):

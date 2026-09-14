@@ -290,7 +290,12 @@ class MujocoEnv(metaclass=EnvMeta):
         if (self.sim is None) or (self.hard_reset and not self.deterministic_reset):
             if self.renderer == "mujoco":
                 self._destroy_viewer()
-                self._destroy_sim()
+            # Always free the previous MjSim (and its offscreen render context) before building a new one,
+            # regardless of renderer. Otherwise sim <-> MjRenderContextOffscreen survive as a reference cycle
+            # and are only freed by the cyclic GC at an arbitrary later step; MjrContext.free() then releases
+            # GL objects in whatever GL context is current (the new, live one) and every later offscreen frame
+            # is corrupted. See ARISE-Initiative/robosuite PR #701 and issue #779.
+            self._destroy_sim()
             self._load_model()
             self._initialize_sim()
         # Else, we only reset the sim internally
